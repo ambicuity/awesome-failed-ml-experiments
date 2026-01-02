@@ -1,0 +1,139 @@
+# =============================================================================
+# Validate Pull Request Workflow
+# =============================================================================
+#
+# This workflow validates new submissions when a PR is opened or updated.
+#
+# Checks performed:
+# 1. Python code formatting (ruff + black in check mode)
+# 2. Markdown structure validation
+# 3. Link validation (no dead links)
+# 4. Duplicate detection (fuzzy matching)
+#
+# Author: Ritesh Rana (riteshrana36@gmail.com)
+# =============================================================================
+
+name: Validate Submissions
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'submissions/**/*.md'
+      - 'scripts/**/*.py'
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new run is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal permissions for validation workflow
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate PR
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Setup
+      # -----------------------------------------------------------------------
+
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for diff
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # -----------------------------------------------------------------------
+      # Code Quality Checks
+      # -----------------------------------------------------------------------
+
+      - name: 🔍 Run Ruff (linter)
+        run: |
+          echo "Running Ruff linter..."
+          ruff check scripts/ --output-format=github
+        continue-on-error: false
+
+      - name: 🎨 Run Black (formatter check)
+        run: |
+          echo "Checking code formatting with Black..."
+          black --check --diff scripts/
+        continue-on-error: false
+
+      # -----------------------------------------------------------------------
+      # Get Changed Files
+      # -----------------------------------------------------------------------
+
+      - name: 📋 Get changed submission files
+        id: changed-files
+        run: |
+          # Get list of changed/added markdown files in submissions/
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- 'submissions/**/*.md' 2>/dev/null || echo "")
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No submission files changed"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            # Convert to space-separated list
+            FILES_LIST=$(echo "$CHANGED_FILES" | tr '\n' ' ')
+            echo "files=$FILES_LIST" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------------------------
+      # Submission Validation
+      # -----------------------------------------------------------------------
+
+      - name: ✅ Validate submission structure
+        if: steps.changed-files.outputs.has_changes == 'true'
+        run: |
+          echo "Validating submission structure..."
+          python scripts/validate_submission.py ${{ steps.changed-files.outputs.files }}
+
+      - name: 🔗 Check links
+        if: steps.changed-files.outputs.has_changes == 'true'
+        run: |
+          echo "Checking for broken links..."
+          python scripts/link_check.py ${{ steps.changed-files.outputs.files }}
+
+      - name: 🔍 Check for duplicates
+        if: steps.changed-files.outputs.has_changes == 'true'
+        run: |
+          echo "Checking for duplicate submissions..."
+          python scripts/deduplicate.py ${{ steps.changed-files.outputs.files }}
+
+      # -----------------------------------------------------------------------
+      # Summary
+      # -----------------------------------------------------------------------
+
+      - name: 📊 Validation Summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "       VALIDATION COMPLETE"
+          echo "========================================"
+          if [ "${{ steps.changed-files.outputs.has_changes }}" == "true" ]; then
+            echo "Validated files: ${{ steps.changed-files.outputs.files }}"
+          else
+            echo "No submission files to validate"
+          fi
+          echo "========================================"
