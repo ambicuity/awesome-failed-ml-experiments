@@ -1,0 +1,257 @@
+# =============================================================================
+# Auto-Merge Workflow
+# =============================================================================
+#
+# This workflow automatically merges PRs that pass all validation checks.
+#
+# Triggers:
+# - When the "Validate Submissions" workflow completes successfully
+#
+# Actions:
+# 1. Auto-approve the PR
+# 2. Update README.md with new submission
+# 3. Squash merge the PR
+#
+# Author: Ritesh Rana (riteshrana36@gmail.com)
+# =============================================================================
+
+name: Auto-Merge
+
+on:
+  # Trigger when validation workflow completes
+  workflow_run:
+    workflows: ["Validate Submissions"]
+    types:
+      - completed
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to merge'
+        required: true
+        type: number
+
+# Permissions needed for auto-merge
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Auto-Merge PR
+    runs-on: ubuntu-latest
+
+    # Only run if validation passed
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'pull_request')
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Setup
+      # -----------------------------------------------------------------------
+
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # -----------------------------------------------------------------------
+      # Get PR Information
+      # -----------------------------------------------------------------------
+
+      - name: 🔍 Get PR number from workflow run
+        id: get-pr
+        if: github.event_name == 'workflow_run'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get the workflow run that triggered this
+            const run = context.payload.workflow_run;
+
+            // Get PRs associated with this workflow run
+            const prs = run.pull_requests;
+
+            if (prs && prs.length > 0) {
+              const prNumber = prs[0].number;
+              core.setOutput('pr_number', prNumber);
+              core.setOutput('has_pr', 'true');
+              console.log(`Found PR #${prNumber}`);
+            } else {
+              core.setOutput('has_pr', 'false');
+              console.log('No PR found for this workflow run');
+            }
+
+      - name: 📋 Set PR number
+        id: pr-number
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "pr_number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "pr_number=${{ steps.get-pr.outputs.pr_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------------------------
+      # Auto-Approve
+      # -----------------------------------------------------------------------
+
+      - name: ✅ Auto-approve PR
+        if: steps.get-pr.outputs.has_pr == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ steps.pr-number.outputs.pr_number }};
+
+            // Get PR details first
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            // Check if PR is still open
+            if (pr.state !== 'open') {
+              console.log('PR is not open, skipping approval');
+              return;
+            }
+
+            // Check if only submission files are modified
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const hasOnlySubmissions = files.every(file =>
+              file.filename.startsWith('submissions/')
+            );
+
+            if (!hasOnlySubmissions) {
+              console.log('PR contains changes outside submissions/, manual review required');
+              core.setFailed('PR contains non-submission changes');
+              return;
+            }
+
+            // Approve the PR
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              event: 'APPROVE',
+              body: '✅ All automated checks passed! Auto-approving this submission.\n\n_This is an automated approval._'
+            });
+
+            console.log(`Approved PR #${prNumber}`);
+
+      # -----------------------------------------------------------------------
+      # Update README
+      # -----------------------------------------------------------------------
+
+      - name: 📝 Fetch PR branch
+        if: steps.get-pr.outputs.has_pr == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          PR_NUMBER=${{ steps.pr-number.outputs.pr_number }}
+          gh pr checkout $PR_NUMBER --detach
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📝 Update README
+        if: steps.get-pr.outputs.has_pr == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Updating README with new submission..."
+          python scripts/update_readme.py
+
+      - name: 💾 Commit README update
+        if: steps.get-pr.outputs.has_pr == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          # Check if README was modified
+          if git diff --quiet README.md; then
+            echo "No changes to README"
+          else
+            git add README.md
+            git commit -m "📝 Update README with new submission"
+            git push origin HEAD:refs/heads/$(gh pr view ${{ steps.pr-number.outputs.pr_number }} --json headRefName --jq '.headRefName')
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Merge PR
+      # -----------------------------------------------------------------------
+
+      - name: 🔀 Squash merge PR
+        if: steps.get-pr.outputs.has_pr == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ steps.pr-number.outputs.pr_number }};
+
+            try {
+              // Get PR details
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+
+              // Check if PR is mergeable
+              if (!pr.mergeable) {
+                console.log('PR is not mergeable');
+                core.setFailed('PR is not mergeable');
+                return;
+              }
+
+              // Squash merge the PR
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: `🎉 Add: ${pr.title} (#${prNumber})`,
+                commit_message: `Auto-merged submission from @${pr.user.login}\n\n${pr.body || ''}`,
+              });
+
+              console.log(`Successfully merged PR #${prNumber}`);
+
+              // Add a comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: '🎉 **Congratulations!** Your submission has been merged!\n\nThank you for sharing your failure with the community. Your experience will help others learn! ❤️\n\n_This merge was performed automatically._'
+              });
+
+            } catch (error) {
+              console.log(`Error merging PR: ${error.message}`);
+              core.setFailed(error.message);
+            }
+
+      # -----------------------------------------------------------------------
+      # Summary
+      # -----------------------------------------------------------------------
+
+      - name: 📊 Summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "       AUTO-MERGE COMPLETE"
+          echo "========================================"
+          echo "PR Number: ${{ steps.pr-number.outputs.pr_number }}"
+          echo "========================================"
