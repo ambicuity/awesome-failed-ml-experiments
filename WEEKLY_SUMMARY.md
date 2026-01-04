@@ -6,7 +6,7 @@
 
 ## 📅 Latest Summary
 
-**Week of December 26 - January 02, 2026**
+**Week of December 28 - January 04, 2026**
 
 ### 🆕 New Submissions (1)
 
